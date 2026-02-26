@@ -188,10 +188,7 @@ impl Transaction {
         .when(|e| e.retryable())
         .notify(move |err, dur| {
             log::warn!(
-                "Transaction commit for {} failed with retryable error, retrying in {:?}: {}",
-                table_ident,
-                dur,
-                err
+                "Transaction commit for {table_ident} failed with retryable error, retrying in {dur:?}: {err}"
             );
         })
         .await
