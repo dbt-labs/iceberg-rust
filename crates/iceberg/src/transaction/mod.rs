@@ -208,37 +208,60 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+        log::info!("[do_commit] entering do_commit for table {:?}", self.table.identifier());
+
+        log::info!("[do_commit] calling catalog.load_table...");
         let refreshed = catalog.load_table(self.table.identifier()).await?;
+        log::info!("[do_commit] catalog.load_table returned successfully");
 
         if self.table.metadata() != refreshed.metadata()
             || self.table.metadata_location() != refreshed.metadata_location()
         {
-            // current base is stale, use refreshed as base and re-apply transaction actions
+            log::info!("[do_commit] base is stale, refreshing table");
             self.table = refreshed.clone();
+        } else {
+            log::info!("[do_commit] base is up to date, no refresh needed");
         }
 
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
-        for action in &self.actions {
+        log::info!("[do_commit] processing {} actions", self.actions.len());
+        for (i, action) in self.actions.iter().enumerate() {
+            log::info!("[do_commit] committing action {}/{}...", i + 1, self.actions.len());
             let action_commit = Arc::clone(action).commit(&current_table).await?;
-            // apply action commit to current_table
-            current_table = Self::apply(
+            log::info!("[do_commit] action {}/{} commit returned, applying...", i + 1, self.actions.len());
+            let apply_result = Self::apply(
                 current_table,
                 action_commit,
                 &mut existing_updates,
                 &mut existing_requirements,
-            )?;
+            );
+            match apply_result {
+                Ok(table) => {
+                    log::info!("[do_commit] action {}/{} applied successfully", i + 1, self.actions.len());
+                    current_table = table;
+                }
+                Err(e) => {
+                    log::info!("[do_commit] action {}/{} apply failed: {}", i + 1, self.actions.len(), e);
+                    return Err(e);
+                }
+            }
         }
 
+        log::info!("[do_commit] building TableCommit with {} updates and {} requirements",
+            existing_updates.len(), existing_requirements.len());
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
             .build();
 
-        catalog.update_table(table_commit).await
+        log::info!("[do_commit] calling catalog.update_table...");
+        let result = catalog.update_table(table_commit).await;
+        log::info!("[do_commit] catalog.update_table returned with success={}", result.is_ok());
+        result
     }
 }
 
