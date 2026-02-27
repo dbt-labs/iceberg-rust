@@ -178,9 +178,7 @@ impl Transaction {
         let table_ident = tx.table.identifier().clone();
 
         log::info!(
-            "Starting transaction commit for {} with backoff {:?}",
-            table_ident,
-            backoff
+            "Starting transaction commit for {table_ident} with backoff {backoff:?}"
         );
         (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
