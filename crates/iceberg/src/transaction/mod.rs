@@ -177,7 +177,11 @@ impl Transaction {
 
         let table_ident = tx.table.identifier().clone();
 
-        log::info!("Starting transaction commit for {}", table_ident.clone());
+        log::info!(
+            "Starting transaction commit for {} with backoff {:?}",
+            table_ident,
+            backoff
+        );
         (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
@@ -259,7 +263,7 @@ impl Transaction {
                     current_table = table;
                 }
                 Err(e) => {
-                    log::info!(
+                    log::warn!(
                         "[do_commit] action {}/{} apply failed: {}",
                         i + 1,
                         self.actions.len(),
