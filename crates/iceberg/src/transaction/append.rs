@@ -97,7 +97,13 @@ impl TransactionAction for FastAppendAction {
 
         // Checks duplicate files
         if self.check_duplicate {
-            snapshot_producer.validate_duplicate_files().await?;
+            let start = std::time::Instant::now();
+            let result = snapshot_producer.validate_duplicate_files().await;
+            log::info!(
+                "[FastAppendAction] validate_duplicate_files took {:?}",
+                start.elapsed()
+            );
+            result?;
         }
 
         snapshot_producer
