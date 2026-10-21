@@ -99,8 +99,8 @@ impl AddColumn {
 ///
 /// This action accumulates schema modifications (column additions and deletions)
 /// via builder methods. At commit time, it validates all operations against the
-/// current table schema, auto-assigns field IDs from `table.metadata().last_column_id()`,
-/// builds a new schema, and emits `AddSchema` + `SetCurrentSchema` updates with a
+/// current table schema, auto-assigns field IDs from `table.metadata().last_column_id()`
+/// (unless a column was given an explicit ID via [`AddColumn::id`]), builds a new schema, and emits `AddSchema` + `SetCurrentSchema` updates with a
 /// `CurrentSchemaIdMatch` requirement.
 ///
 /// # Example
@@ -158,6 +158,23 @@ impl UpdateSchemaAction {
 // ID assignment helpers
 // ---------------------------------------------------------------------------
 
+/// Collect the IDs of a `NestedField` and all its nested sub-fields.
+fn collect_field_ids(field: &NestedField, ids: &mut Vec<i32>) {
+    ids.push(field.id);
+    match field.field_type.as_ref() {
+        Type::Primitive(_) => {}
+        Type::Struct(struct_type) => struct_type
+            .fields()
+            .iter()
+            .for_each(|f| collect_field_ids(f, ids)),
+        Type::List(list_type) => collect_field_ids(&list_type.element_field, ids),
+        Type::Map(map_type) => {
+            collect_field_ids(&map_type.key_field, ids);
+            collect_field_ids(&map_type.value_field, ids);
+        }
+    }
+}
+
 /// Recursively assign fresh field IDs to a `NestedField` and all its nested sub-fields.
 ///
 /// This follows the same recursive pattern as `ReassignFieldIds::reassign_ids_visit_type`
@@ -165,19 +182,6 @@ impl UpdateSchemaAction {
 /// IDs rather than reassigning an existing schema. `ReassignFieldIds` cannot be used
 /// directly here because it rejects duplicate old IDs (all new fields share placeholder
 /// ID `DEFAULT_FIELD_ID`).
-/// Highest field ID in a `NestedField` and all its nested sub-fields.
-fn max_field_id(field: &NestedField) -> i32 {
-    let nested_max = match field.field_type.as_ref() {
-        Type::Primitive(_) => None,
-        Type::Struct(struct_type) => struct_type.fields().iter().map(|f| max_field_id(f)).max(),
-        Type::List(list_type) => Some(max_field_id(&list_type.element_field)),
-        Type::Map(map_type) => {
-            Some(max_field_id(&map_type.key_field).max(max_field_id(&map_type.value_field)))
-        }
-    };
-    nested_max.map_or(field.id, |m| m.max(field.id))
-}
-
 fn assign_fresh_ids(field: &NestedField, next_id: &mut i32) -> NestedFieldRef {
     *next_id += 1;
     let new_id = *next_id;
@@ -351,15 +355,24 @@ impl TransactionAction for UpdateSchemaAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let base_schema = table.metadata().current_schema();
         let mut last_column_id = table.metadata().last_column_id();
+
+        // Explicit IDs must be new: anything at or below `last_column_id` may belong to a
+        // dropped column, and reusing it would make old data files read as the new column.
+        let mut explicit_ids = Vec::new();
+        for add in self.additions.iter().filter(|add| add.id.is_some()) {
+            collect_field_ids(&add.to_nested_field(), &mut explicit_ids);
+        }
+        if let Some(&id) = explicit_ids.iter().find(|&&id| id <= last_column_id) {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!(
+                    "Cannot add column with explicit field id {id}: ids must be greater than the last assigned column id {last_column_id}"
+                ),
+            ));
+        }
         // Fresh IDs start above any explicit ID so the two can be mixed in one update.
-        if let Some(max_explicit_id) = self
-            .additions
-            .iter()
-            .filter(|add| add.id.is_some())
-            .map(|add| max_field_id(&add.to_nested_field()))
-            .max()
-        {
-            last_column_id = last_column_id.max(max_explicit_id);
+        if let Some(&max_explicit_id) = explicit_ids.iter().max() {
+            last_column_id = max_explicit_id;
         }
 
         // --- 1. Validate deletes ---
@@ -507,7 +520,8 @@ mod tests {
     use as_any::Downcast;
 
     use crate::spec::{
-        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, StructType, TableMetadata, Type,
+        DEFAULT_SCHEMA_ID, ListType, Literal, NestedField, PrimitiveType, StructType,
+        TableMetadata, Type,
     };
     use crate::table::Table;
     use crate::transaction::Transaction;
@@ -1279,5 +1293,68 @@ mod tests {
         );
 
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_column_with_explicit_id_keeps_list_element_ids() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        let items = Type::List(ListType {
+            element_field: NestedField::required(
+                11,
+                "element",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(10, "sku", Type::Primitive(PrimitiveType::String)).into(),
+                ])),
+            )
+            .into(),
+        });
+        let action = tx.update_schema().add_column(
+            AddColumn::builder()
+                .name("items")
+                .field_type(items)
+                .id(12)
+                .build(),
+        );
+
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let new_schema = new_schema_from(&updates);
+
+        assert_eq!(new_schema.field_by_name("items").unwrap().id, 12);
+        assert_eq!(new_schema.field_by_name("items.element").unwrap().id, 11);
+        assert_eq!(
+            new_schema.field_by_name("items.element.sku").unwrap().id,
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_column_with_explicit_id_not_above_last_column_id_fails() {
+        let table = make_v2_table();
+
+        // A nested ID at or below last_column_id (3) could reuse a dropped column's ID.
+        let nested = Type::Struct(StructType::new(vec![
+            NestedField::optional(2, "child", Type::Primitive(PrimitiveType::String)).into(),
+        ]));
+        for (id, field_type) in [
+            (0, Type::Primitive(PrimitiveType::Int)),
+            (-1, Type::Primitive(PrimitiveType::Int)),
+            (3, Type::Primitive(PrimitiveType::Int)),
+            (10, nested),
+        ] {
+            let action = Transaction::new(&table).update_schema().add_column(
+                AddColumn::builder()
+                    .name("bad")
+                    .field_type(field_type)
+                    .id(id)
+                    .build(),
+            );
+            let Err(err) = Arc::new(action).commit(&table).await else {
+                panic!("explicit id {id} should be rejected");
+            };
+            assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "id {id}");
+        }
     }
 }
